@@ -1,0 +1,26 @@
+---
+# Variables shared by every playbook.
+# IP addresses are NOT here - Terraform injects those into inventory.ini.
+
+# --- Application ---
+app_name: travelmemory
+app_repo: "https://github.com/UnpredictablePrashant/TravelMemory.git"
+app_dir: /opt/travelmemory
+app_user: travelmemory          # unprivileged system user that runs Node
+backend_port: 3001
+
+# --- Node.js ---
+nodejs_major_version: "20"
+
+# --- MongoDB ---
+mongodb_version: "7.0"
+mongo_db_name: travelmemory
+
+# Administrative (root-equivalent) MongoDB account
+mongo_admin_user: mongoadmin
+mongo_admin_password: "My_admin_545"
+
+# Least-privilege account the app actually uses: readWrite on the
+# travelmemory database ONLY. It cannot touch other DBs or create users.
+mongo_app_user: travelapp
+mongo_app_password: "My_app_545"

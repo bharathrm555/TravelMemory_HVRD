@@ -1,0 +1,24 @@
+# Managed by Ansible - manual edits will be overwritten.
+
+storage:
+  dbPath: /var/lib/mongodb
+
+systemLog:
+  destination: file
+  logAppend: true
+  path: /var/log/mongodb/mongod.log
+
+net:
+  port: 27017
+  # SECURITY: listen on loopback + this host's private VPC address ONLY.
+  # The public internet has no route here, and the security group further
+  # restricts port 27017 to the web server's security group.
+  bindIp: 127.0.0.1,{{ ansible_default_ipv4.address }}
+
+processManagement:
+  timeZoneInfo: /usr/share/zoneinfo
+
+security:
+  # SECURITY: without this, ANY client that reaches the port has full admin
+  # rights. This is the single most important MongoDB setting.
+  authorization: enabled

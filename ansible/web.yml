@@ -1,0 +1,236 @@
+---
+- name: Deploy the TravelMemory MERN application on the public web server
+  hosts: web
+  become: true
+
+  tasks:
+    - name: Wait for cloud-init to finish (prevents apt lock clashes)
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    # --- Swap: t3.micro has only 1 GB RAM and the React build needs more ---
+    - name: Check whether swap is already active
+      ansible.builtin.command: swapon --show=NAME --noheadings
+      register: swap_active
+      changed_when: false
+
+    - name: Create a 2 GB swap file
+      when: "'/swapfile' not in swap_active.stdout"
+      block:
+        - name: Allocate the swap file
+          ansible.builtin.command: fallocate -l 2G /swapfile
+          args:
+            creates: /swapfile
+
+        - name: Restrict swap file permissions
+          ansible.builtin.file:
+            path: /swapfile
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Format the swap file
+          ansible.builtin.command: mkswap /swapfile
+
+        - name: Enable the swap file
+          ansible.builtin.command: swapon /swapfile
+
+    - name: Persist swap across reboots
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        line: "/swapfile none swap sw 0 0"
+        state: present
+
+    # --- Packages ---------------------------------------------------------
+    - name: Install base packages
+      ansible.builtin.apt:
+        name: [git, curl, gnupg, ca-certificates, nginx]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Add the NodeSource signing key
+      ansible.builtin.shell:
+        cmd: >
+          curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+          | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg
+        creates: /usr/share/keyrings/nodesource.gpg
+
+    - name: Add the NodeSource apt repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [signed-by=/usr/share/keyrings/nodesource.gpg]
+          https://deb.nodesource.com/node_{{ nodejs_major_version }}.x nodistro main
+        filename: nodesource
+        state: present
+        update_cache: true
+
+    - name: Install Node.js {{ nodejs_major_version }}
+      ansible.builtin.apt:
+        name: nodejs
+        state: present
+
+    - name: Report the installed Node.js and npm versions
+      ansible.builtin.shell: node --version && npm --version
+      register: node_versions
+      changed_when: false
+
+    # --- Application ------------------------------------------------------
+    - name: Create the unprivileged application user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ app_dir }}"
+        create_home: false
+
+    - name: Clone the TravelMemory repository
+      ansible.builtin.git:
+        repo: "{{ app_repo }}"
+        dest: "{{ app_dir }}"
+        force: true
+
+    - name: Install backend dependencies
+      ansible.builtin.command:
+        cmd: npm install --no-audit --no-fund
+        chdir: "{{ app_dir }}/backend"
+        creates: "{{ app_dir }}/backend/node_modules"
+
+    - name: Deploy the backend environment file
+      ansible.builtin.template:
+        src: templates/backend.env.j2
+        dest: "{{ app_dir }}/backend/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0640"
+      notify: Restart backend
+
+    - name: Deploy the frontend environment file
+      ansible.builtin.template:
+        src: templates/frontend.env.j2
+        dest: "{{ app_dir }}/frontend/.env"
+        mode: "0644"
+      register: frontend_env
+
+    - name: Install frontend dependencies (slow - a few minutes)
+      ansible.builtin.command:
+        cmd: npm install --no-audit --no-fund
+        chdir: "{{ app_dir }}/frontend"
+        creates: "{{ app_dir }}/frontend/node_modules"
+
+    - name: Check whether a production build already exists
+      ansible.builtin.stat:
+        path: "{{ app_dir }}/frontend/build/index.html"
+      register: react_build
+
+    - name: Build the React production bundle (slow - a few minutes)
+      ansible.builtin.command:
+        cmd: npm run build
+        chdir: "{{ app_dir }}/frontend"
+      environment:
+        CI: "false"      # treat lint warnings as warnings, not errors
+      when: frontend_env.changed or not react_build.stat.exists
+      changed_when: true
+
+    - name: Hand ownership of the application to the app user
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: true
+
+    # --- Backend service --------------------------------------------------
+    - name: Install the backend systemd unit
+      ansible.builtin.template:
+        src: templates/travelmemory-backend.service.j2
+        dest: /etc/systemd/system/travelmemory-backend.service
+        mode: "0644"
+      notify: Restart backend
+
+    - name: Enable and start the backend service
+      ansible.builtin.systemd:
+        name: travelmemory-backend
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    # --- Nginx ------------------------------------------------------------
+    - name: Deploy the Nginx site configuration
+      ansible.builtin.template:
+        src: templates/nginx-travelmemory.conf.j2
+        dest: /etc/nginx/sites-available/travelmemory
+        mode: "0644"
+      notify: Reload Nginx
+
+    - name: Enable the TravelMemory site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/travelmemory
+        dest: /etc/nginx/sites-enabled/travelmemory
+        state: link
+      notify: Reload Nginx
+
+    - name: Remove the default Nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload Nginx
+
+    - name: Validate the Nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Apply pending restarts now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Ensure Nginx is running and enabled at boot
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+    # --- End-to-end verification -----------------------------------------
+    - name: Verify Express answers through the Nginx proxy
+      ansible.builtin.uri:
+        url: http://127.0.0.1/api/hello
+        return_content: true
+      register: api_check
+      retries: 6
+      delay: 5
+      until: api_check.status is defined and api_check.status == 200
+
+    - name: Verify the backend can actually query MongoDB
+      ansible.builtin.uri:
+        url: http://127.0.0.1/api/trip/
+        return_content: true
+      register: trip_check
+      retries: 6
+      delay: 5
+      until: trip_check.status is defined and trip_check.status == 200
+
+    - name: Verify the React frontend is being served
+      ansible.builtin.uri:
+        url: http://127.0.0.1/
+        return_content: true
+      register: ui_check
+
+    - name: Deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "Node/npm .............. {{ node_versions.stdout_lines | join(' / ') }}"
+          - "GET /api/hello ........ {{ api_check.status }} -> {{ api_check.content }}"
+          - "GET /api/trip/ ........ {{ trip_check.status }} (proves MongoDB is reachable)"
+          - "GET / ................. {{ ui_check.status }} (React bundle served by Nginx)"
+          - "Open the app at ....... http://{{ web_public_ip }}"
+
+  handlers:
+    - name: Restart backend
+      ansible.builtin.systemd:
+        name: travelmemory-backend
+        state: restarted
+        daemon_reload: true
+
+    - name: Reload Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded

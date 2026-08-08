@@ -1,0 +1,143 @@
+---
+- name: Configure the private MongoDB database server
+  hosts: db
+  become: true
+
+  tasks:
+    - name: Wait for cloud-init to finish (prevents apt lock clashes)
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: Install repository prerequisites
+      ansible.builtin.apt:
+        name: [curl, gnupg, ca-certificates]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Add the MongoDB {{ mongodb_version }} signing key
+      ansible.builtin.shell:
+        cmd: >
+          curl -fsSL https://pgp.mongodb.com/server-{{ mongodb_version }}.asc
+          | gpg --dearmor -o /usr/share/keyrings/mongodb-server-{{ mongodb_version }}.gpg
+        creates: /usr/share/keyrings/mongodb-server-{{ mongodb_version }}.gpg
+
+    - name: Add the MongoDB apt repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-{{ mongodb_version }}.gpg ]
+          https://repo.mongodb.org/apt/ubuntu
+          {{ ansible_distribution_release }}/mongodb-org/{{ mongodb_version }} multiverse
+        filename: mongodb-org-{{ mongodb_version }}
+        state: present
+        update_cache: true
+
+    - name: Install MongoDB server and shell
+      ansible.builtin.apt:
+        name: mongodb-org
+        state: present
+
+    - name: Ensure MongoDB is running and enabled at boot
+      ansible.builtin.service:
+        name: mongod
+        state: started
+        enabled: true
+
+    - name: Wait for MongoDB to accept connections
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 27017
+        delay: 2
+        timeout: 90
+
+    # --- Users: created BEFORE auth is switched on -------------------------
+    - name: Check whether database users were already created
+      ansible.builtin.stat:
+        path: /etc/mongodb-users-created
+      register: mongo_users_marker
+
+    - name: Create MongoDB users
+      when: not mongo_users_marker.stat.exists
+      block:
+        - name: Create the administrative (root) user
+          ansible.builtin.command:
+            argv:
+              - mongosh
+              - --quiet
+              - --host
+              - 127.0.0.1
+              - --eval
+              - >
+                db.getSiblingDB("admin").createUser({
+                  user: "{{ mongo_admin_user }}",
+                  pwd: "{{ mongo_admin_password }}",
+                  roles: [{ role: "root", db: "admin" }]
+                })
+          no_log: true
+
+        - name: Create the least-privilege application user
+          ansible.builtin.command:
+            argv:
+              - mongosh
+              - --quiet
+              - --host
+              - 127.0.0.1
+              - --eval
+              - >
+                db.getSiblingDB("{{ mongo_db_name }}").createUser({
+                  user: "{{ mongo_app_user }}",
+                  pwd: "{{ mongo_app_password }}",
+                  roles: [{ role: "readWrite", db: "{{ mongo_db_name }}" }]
+                })
+          no_log: true
+
+        - name: Record that users have been created
+          ansible.builtin.file:
+            path: /etc/mongodb-users-created
+            state: touch
+            mode: "0600"
+
+    # --- Now lock the server down ------------------------------------------
+    - name: Deploy hardened mongod.conf (private bind + auth required)
+      ansible.builtin.template:
+        src: templates/mongod.conf.j2
+        dest: /etc/mongod.conf
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      notify: Restart MongoDB
+
+    - name: Apply the new configuration immediately
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for MongoDB to come back after the restart
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 27017
+        delay: 3
+        timeout: 90
+
+    - name: Verify the application user can authenticate
+      ansible.builtin.shell:
+        cmd: >
+          mongosh --quiet
+          "mongodb://${MONGO_USER}:${MONGO_PASS}@127.0.0.1:27017/{{ mongo_db_name }}?authSource={{ mongo_db_name }}"
+          --eval 'db.runCommand({ ping: 1 }).ok'
+      environment:
+        MONGO_USER: "{{ mongo_app_user }}"
+        MONGO_PASS: "{{ mongo_app_password }}"
+      register: mongo_auth_check
+      changed_when: false
+
+
+    - name: Report the verification result
+      ansible.builtin.debug:
+        msg: "Authenticated ping to '{{ mongo_db_name }}' returned: {{ mongo_auth_check.stdout | trim }}  (1 = success)"
+
+  handlers:
+    - name: Restart MongoDB
+      ansible.builtin.service:
+        name: mongod
+        state: restarted

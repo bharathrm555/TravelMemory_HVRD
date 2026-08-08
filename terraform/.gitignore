@@ -1,0 +1,12 @@
+# Terraform state contains IPs, IDs and can contain secrets - never commit it.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log
+
+# Your personal variable overrides
+terraform.tfvars
+*.auto.tfvars
+tfplan
+tfplan.*

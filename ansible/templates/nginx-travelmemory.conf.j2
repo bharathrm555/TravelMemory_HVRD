@@ -1,0 +1,27 @@
+# Managed by Ansible - do not edit by hand.
+server {
+    listen 80 default_server;
+    server_name _;
+
+    server_tokens off;   # don't advertise the nginx version
+
+    root {{ app_dir }}/frontend/build;
+    index index.html;
+
+    # React Router owns client-side paths, so any unknown URL must still
+    # return index.html rather than a 404.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Reverse proxy to Express. The TRAILING SLASH on proxy_pass strips the
+    # /api prefix: browser asks for /api/trip/  ->  Express receives /trip/
+    location /api/ {
+        proxy_pass http://127.0.0.1:{{ backend_port }}/;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

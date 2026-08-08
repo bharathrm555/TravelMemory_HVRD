@@ -1,0 +1,128 @@
+---
+- name: Security hardening for all TravelMemory servers
+  hosts: all
+  become: true
+
+  tasks:
+    # --- SSH lockdown -----------------------------------------------------
+    - name: Deploy hardened SSH configuration
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-hardening.conf
+        mode: "0644"
+        validate: /usr/sbin/sshd -t -f %s
+        content: |
+          # Managed by Ansible.
+          # Ubuntu includes this directory from the TOP of sshd_config, and
+          # sshd honours the FIRST value it sees for any option - so the "00"
+          # prefix guarantees these settings win over everything else.
+          PermitRootLogin no
+          PasswordAuthentication no
+          PubkeyAuthentication yes
+          PermitEmptyPasswords no
+          KbdInteractiveAuthentication no
+          X11Forwarding no
+          MaxAuthTries 3
+          ClientAliveInterval 300
+          ClientAliveCountMax 2
+      notify: Restart SSH
+
+    # --- Packages ---------------------------------------------------------
+    - name: Install firewall, brute-force protection and auto-updates
+      ansible.builtin.apt:
+        name: [ufw, fail2ban, unattended-upgrades]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Enable automatic security updates
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+
+    - name: Configure fail2ban to ban SSH brute-force attempts
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.local
+        mode: "0644"
+        content: |
+          [DEFAULT]
+          bantime  = 1h
+          findtime = 10m
+          maxretry = 5
+
+          [sshd]
+          enabled = true
+      notify: Restart fail2ban
+
+    # --- Host firewall (defence in depth behind the security groups) ------
+    - name: Set default firewall policies (deny everything inbound)
+      community.general.ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: incoming, policy: deny }
+        - { direction: outgoing, policy: allow }
+
+    - name: WEB - allow SSH from the administrator IP only
+      community.general.ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+        src: "{{ admin_cidr }}"
+      when: inventory_hostname in groups['web']
+
+    - name: WEB - allow HTTP from anywhere
+      community.general.ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+      when: inventory_hostname in groups['web']
+
+    - name: DB - allow SSH from the public subnet (bastion) only
+      community.general.ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+        src: "{{ public_subnet_cidr }}"
+      when: inventory_hostname in groups['db']
+
+    - name: DB - allow MongoDB from the public subnet only
+      community.general.ufw:
+        rule: allow
+        port: "27017"
+        proto: tcp
+        src: "{{ public_subnet_cidr }}"
+      when: inventory_hostname in groups['db']
+
+    - name: Enable the firewall
+      community.general.ufw:
+        state: enabled
+
+    # --- Prove it worked --------------------------------------------------
+    - name: Read the EFFECTIVE sshd settings (not just the file on disk)
+      ansible.builtin.shell:
+        cmd: sshd -T | grep -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication|maxauthtries) '
+      register: sshd_effective
+      changed_when: false
+
+    - name: Read the firewall state
+      ansible.builtin.command: ufw status verbose
+      register: ufw_status
+      changed_when: false
+
+    - name: Hardening summary
+      ansible.builtin.debug:
+        msg: "{{ sshd_effective.stdout_lines + [''] + ufw_status.stdout_lines }}"
+
+  handlers:
+    - name: Restart SSH
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+    - name: Restart fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted
