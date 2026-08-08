@@ -1478,9 +1478,46 @@ aws ec2 describe-nat-gateways --region ap-south-1 \
   --filter "Name=state,Values=available" --query 'NatGateways[].NatGatewayId' --output text
 ```
 
-Both should return nothing. To rebuild later, `terraform apply` then re-run the
-three playbooks — **no code changes needed**, since MongoDB's data lives on the
-instance's disk and is deleted with it.
+Both should return nothing. To bring the environment back, see section 14.
+
+---
+
+## 14. Rebuilding for a live demo
+
+The environment is fully reproducible from this repository. Rebuilding from
+nothing takes roughly **20 minutes** and needs **no code changes at all**:
+
+```bash
+cd terraform && terraform apply          # ~4 min
+cd ../ansible
+ansible-playbook db.yml                  # ~3 min
+ansible-playbook web.yml                 # ~10 min
+ansible-playbook harden.yml              # ~2 min
+```
+
+Then re-seed the sample data using the `curl` commands in section 8 — MongoDB's
+data lives on the instance's disk and is destroyed along with it.
+
+Three things differ on every rebuild, and all three are handled automatically:
+
+| What changes | How it is handled |
+|---|---|
+| New web public IP and DB private IP | `outputs.tf` regenerates `ansible/inventory.ini` on every apply — never edit it by hand |
+| Your home/office public IP | `security.tf` re-detects it via `checkip.amazonaws.com`, so the SSH rule follows you |
+| `REACT_APP_BACKEND_URL` in the React bundle | `web.yml` re-renders `frontend.env.j2` and rebuilds the bundle when the value changes |
+
+The only manual edit is the `IP=` variable in the seeding commands in section 8.
+
+Verify the rebuild the same way as the original deployment:
+
+```bash
+ansible all -m ping                                          # both hosts -> pong
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' http://<new-ip>/   # HTTP 200
+```
+
+> **Note:** `ansible/inventory.ini` is a Terraform-generated file. It is removed
+> by `terraform destroy` and recreated by `terraform apply`, so its absence in a
+> torn-down repository is expected, not a missing file.
 
 ---
 
